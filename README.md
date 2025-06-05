@@ -1,6 +1,6 @@
-# 📦 Déploiement automatisé d'une application WordPress sur Kubernetes avec Ansible
+# Déploiement automatisé d'une application WordPress sur Kubernetes avec Ansible
 
-## 🧠 Objectif du projet
+## Objectif du projet
 
 Automatiser, à l'aide d’**Ansible**, le déploiement d’un cluster Kubernetes (1 master + 2 workers) hébergeant l'application **WordPress** connectée à une base de données **MySQL**, avec persistance des données via un serveur **NFS**, en intégrant :
 
@@ -11,7 +11,7 @@ Automatiser, à l'aide d’**Ansible**, le déploiement d’un cluster Kubernete
 - Exposition de WordPress en NodePort
 - Sauvegarde locale de la base ETCD
 
-## 🧱 Architecture
+## Architecture
 
 ```
 +---------------------------+
@@ -38,7 +38,7 @@ Automatiser, à l'aide d’**Ansible**, le déploiement d’un cluster Kubernete
   +--------------------------+
 ```
 
-## 🛠 Technologies
+## Technologies
 
 - **Ansible**
 - **Kubernetes**
@@ -47,7 +47,7 @@ Automatiser, à l'aide d’**Ansible**, le déploiement d’un cluster Kubernete
 - **ETCD**
 - **Flannel**
 
-## 🧾 Structure des fichiers
+## Structure des fichiers
 
 ```
 project/
@@ -59,7 +59,7 @@ project/
 └── README.md
 ```
 
-## ⚙️ Étapes automatisées
+## Étapes automatisées
 
 1. Installation : Docker, Kubernetes, NFS
 2. Init cluster K8s, join des nœuds
@@ -74,14 +74,14 @@ project/
    - Services (MySQL ClusterIP, WordPress NodePort)
 6. Sauvegarde ETCD locale
 
-## 🌐 Accès WordPress
+## Accès WordPress
 
 ```
 http://10.20.234.60:30080
 
 ```
 
-## 🔒 Secrets
+## Secrets
 
 | Clé                        | Description                   |
 |---------------------------|-------------------------------|
@@ -104,7 +104,7 @@ Restauration manuelle :
 ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd/etcd-xxx.db --data-dir /var/lib/etcd-from-backup
 ```
 
-## ✅ Tests de validation
+## Tests de validation
 
 - [x] WordPress en ligne via navigateur
 - [x] Base persistée via NFS
@@ -112,7 +112,7 @@ ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd/etcd-xxx.db --data-dir /var/
 - [x] Sauvegarde ETCD présente
 - [x] Redéploiement sans perte de données
 
-## 📌 Notes
+## Notes
 
 - Mot de passe : `12345` (à sécuriser)
 - NFS utilisé : `/srv/nfs/mysql`
