@@ -89,7 +89,7 @@ http://10.20.234.60:30080
 | mysql-user                | Utilisateur WordPress         |
 | mysql-wordpress-password  | Mot de passe utilisateur WP   |
 
-## 💾 Backup ETCD
+## Backup ETCD
 
 Sauvegarde automatique dans :
 
