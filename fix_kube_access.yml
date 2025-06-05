@@ -1,0 +1,46 @@
+---
+- name: Fix DNS and kubeconfig for kubectl
+  hosts: master
+  become: yes
+  tasks:
+
+    - name: Backup current resolv.conf
+      copy:
+        src: /etc/resolv.conf
+        dest: /etc/resolv.conf.bak
+        remote_src: yes
+      when: ansible_facts['distribution'] == "Ubuntu"
+
+    - name: Set public DNS in resolv.conf
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 1.1.1.1
+          nameserver 8.8.8.8
+
+    - name: Ensure Kubernetes config directory exists
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Copy admin.conf to user kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Test kubectl access
+      command: kubectl get nodes
+      register: kubectl_output
+      failed_when: kubectl_output.rc != 0
+      changed_when: false
+
+    - name: Show kubectl result
+      debug:
+        var: kubectl_output.stdout

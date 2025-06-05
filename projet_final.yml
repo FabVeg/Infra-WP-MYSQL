@@ -1,0 +1,473 @@
+---
+- name: Full Kubernetes Cluster Setup and Application Deployment
+  hosts: all
+  become: yes
+
+  tasks:
+  # COMMON INSTALLS
+  - name: Remove old Kubernetes apt source if it exists
+    ansible.builtin.file:
+      path: /etc/apt/sources.list.d/kubernetes.list
+      state: absent
+
+  - name: Ajouter la clé GPG manquante pour Ubuntu
+    apt_key:
+      keyserver: keyserver.ubuntu.com
+      id: 871920D1991BC93C
+      state: present
+
+  - name: Mettre à jour le cache APT
+    apt:
+      update_cache: yes
+
+  - name: Install required packages
+    apt:
+      name:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - software-properties-common
+        - gnupg2
+      state: present
+      update_cache: yes
+
+
+  - name: Add Docker GPG key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add Docker apt repository
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu focal stable
+      state: present
+
+  - name: Install Docker
+    apt:
+      name: docker-ce
+      state: present
+      update_cache: yes
+
+  - name: Configure Docker daemon
+    copy:
+      dest: /etc/docker/daemon.json
+      content: |
+        {
+          "exec-opts": ["native.cgroupdriver=systemd"],
+          "log-driver": "json-file",
+          "log-opts": {
+            "max-size": "100m"
+          },
+          "storage-driver": "overlay2"
+        }
+    notify: Restart docker
+
+  - name: Enable and start docker
+    systemd:
+      name: docker
+      enabled: yes
+      state: started
+  
+  - name: Create keyrings directory
+    file:
+      path: /etc/apt/keyrings
+      state: directory
+      mode: '0755'
+
+  - name: Download GPG key for Kubernetes
+    get_url:
+      url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+      dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+      mode: '0644'
+
+  - name: Install kubeadm, kubelet, kubectl
+    apt:
+      name:
+        - kubelet
+        - kubeadm
+        - kubectl
+      state: present
+      update_cache: yes
+
+  - name: Hold kube components
+    shell: apt-mark hold kubelet kubeadm kubectl
+
+  - name: Disable swap
+    shell: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Comment swap in fstab
+    replace:
+      path: /etc/fstab
+      regexp: '^([^#].* swap .*)$'
+      replace: '# \1'
+
+  - name: Install NFS clients
+    apt:
+      name: nfs-common
+      state: present
+
+  handlers:
+    - name: Restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+- name: Initialize master node
+  hosts: master
+  become: yes
+  tasks:
+    - name: kubeadm init
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_init
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Configure kubectl for root
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+
+    - name: Apply Flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Save join command
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/kube_join_cmd.sh
+        mode: 0700
+
+- name: Join workers to cluster
+  hosts: k8s_workers
+  become: yes
+  tasks:
+    - name: Copy join command
+      fetch:
+        src: /tmp/kube_join_cmd.sh
+        dest: /tmp/kube_join_cmd.sh
+        flat: yes
+      delegate_to: master
+      run_once: yes
+
+    - name: Run join command
+      shell: sh /tmp/kube_join_cmd.sh
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Setup NFS server
+  hosts: node3
+  become: yes
+  tasks:
+    - name: Install NFS server
+      apt:
+        name: nfs-kernel-server
+        state: present
+
+    - name: Create NFS export
+      file:
+        path: /srv/nfs/mysql
+        state: directory
+        mode: '0777'
+
+    - name: Configure /etc/exports
+      lineinfile:
+        path: /etc/exports
+        line: "/srv/nfs/mysql 10.20.234.0/24(rw,sync,no_subtree_check,no_root_squash)"
+        state: present
+
+    - name: Reload NFS exports
+      command: exportfs -ra
+
+    - name: Start NFS service
+      systemd:
+        name: nfs-kernel-server
+        state: started
+        enabled: yes
+
+- name: Deploy namespace, secrets, configmaps, PVC, apps
+  hosts: master
+  become: yes
+  vars:
+    namespace: wordpress
+    nfs_server_ip: 10.20.234.60
+    wordpress_nodeport: 30080
+    master_ip: 10.20.234.60
+    mysql_root_password: "12345"
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+    - name: Create namespace
+      kubernetes.core.k8s:
+        kind: Namespace
+        name: "{{ namespace }}"
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Encode MySQL secrets in base64
+      set_fact:
+        mysql_root_password_b64: "{{ mysql_root_password | b64encode }}"
+        mysql_user_b64: "{{ 'wordpress' | b64encode }}"      
+    - name: Create MySQL Secret
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mysql-secret
+            namespace: "{{ namespace }}"
+          type: Opaque
+          data:
+            mysql-root-password: "{{ mysql_root_password_b64 }}"
+            mysql-user: "{{ mysql_user_b64 }}"
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Create WordPress ConfigMap
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: wordpress-config
+            namespace: "{{ namespace }}"
+          data:
+            wp_setting_1: "valeur1"
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+   
+    - name: Create MySQL pod 0 NFS directory
+      file:
+        path: /srv/nfs/mysql/mysql-0
+        state: directory
+        owner: nobody
+        group: nogroup
+        mode: '0777'
+
+    - name: Create static PV for mysql-data-mysql-0
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: mysql-data-mysql-0-pv
+          spec:
+            claimRef:
+              namespace: wordpress
+              name: mysql-data-mysql-0
+            capacity:
+              storage: 10Gi
+            accessModes:
+              - ReadWriteMany
+            nfs:
+              server: "{{ nfs_server_ip }}"
+              path: /srv/nfs/mysql/mysql-0
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: ""
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Deploy MySQL
+      kubernetes.core.k8s:
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: mysql
+          spec:
+            selector:
+              matchLabels:
+                app: mysql
+            serviceName: mysql
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: mysql
+              spec:
+                containers:
+                  - name: mysql
+                    image: mysql:5.7
+                    env:
+                      - name: MYSQL_ROOT_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: mysql-secret
+                            key: mysql-root-password
+                    ports:
+                      - containerPort: 3306
+                    volumeMounts:
+                      - name: mysql-data
+                        mountPath: /var/lib/mysql
+            volumeClaimTemplates:
+              - metadata:
+                  name: mysql-data
+                spec:
+                  accessModes: ["ReadWriteMany"]
+                  resources:
+                    requests:
+                      storage: 10Gi
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Expose MySQL with a headless Service
+      kubernetes.core.k8s:
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mysql
+            namespace: wordpress
+          spec:
+            clusterIP: None
+            selector:
+              app: mysql
+            ports:
+              - port: 3306
+                targetPort: 3306
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Wait for MySQL to be ready before setting up users
+      shell: |
+        kubectl exec -n {{ namespace }} -i mysql-0 -- \
+          mysql -u root -p{{ mysql_root_password }} -e "SELECT 1"
+      register: mysql_ready
+      retries: 10
+      delay: 6
+      until: mysql_ready.rc == 0
+
+    - name: Create MySQL init Job
+      kubernetes.core.k8s:
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: mysql-init
+          spec:
+            template:
+              metadata:
+                name: mysql-init
+              spec:
+                restartPolicy: OnFailure
+                containers:
+                  - name: mysql-init
+                    image: mysql:5.7
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - >
+                        mysql -h mysql -u root -p{{ mysql_root_password }} -e "
+                        CREATE DATABASE IF NOT EXISTS wordpress;
+                        CREATE USER IF NOT EXISTS 'wordpress'@'%' IDENTIFIED BY '{{ mysql_root_password }}';
+                        GRANT ALL PRIVILEGES ON wordpress.* TO 'wordpress'@'%';
+                        FLUSH PRIVILEGES;"
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Wait for MySQL init Job to complete
+      shell: |
+        kubectl wait --for=condition=complete --timeout=60s job/mysql-init -n {{ namespace }}
+      register: job_result
+      failed_when: job_result.rc != 0
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Deploy WordPress
+      kubernetes.core.k8s:
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: wordpress
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: wordpress
+            template:
+              metadata:
+                labels:
+                  app: wordpress
+              spec:
+                tolerations:
+                - key: "node-role.kubernetes.io/control-plane"
+                  operator: "Exists"
+                  effect: "NoSchedule"
+                containers:
+                  - name: wordpress
+                    image: wordpress:latest
+                    env:
+                      - name: WORDPRESS_DB_HOST
+                        value: mysql.{{ namespace }}.svc.cluster.local
+                      - name: WORDPRESS_DB_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: mysql-secret
+                            key: mysql-user
+                      - name: WORDPRESS_DB_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: mysql-secret
+                            key: mysql-wordpress-password  # clé à créer dans le secret avec le mdp de l'utilisateur wordpress
+                    ports:
+                      - containerPort: 80
+                    volumeMounts:
+                      - name: wordpress-data
+                        mountPath: /var/www/html
+                volumes:
+                  - name: wordpress-data
+                    hostPath:
+                      path: /srv/wordpress
+                      type: DirectoryOrCreate
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Expose WordPress NodePort
+      kubernetes.core.k8s:
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: wordpress
+          spec:
+            type: NodePort
+            selector:
+              app: wordpress
+            ports:
+              - port: 80
+                nodePort: "{{ wordpress_nodeport }}"
+        state: present
+        kubeconfig: /etc/kubernetes/admin.conf
+
+    - name: Create ETCD backup directory
+      file:
+        path: /backup/etcd
+        state: directory
+
+    - name: Perform ETCD backup
+      shell: |
+        ETCDCTL_API=3 etcdctl snapshot save /backup/etcd/etcd-$(date +%Y%m%d%H%M%S).db \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key
+      args:
+        creates: /backup/etcd
+
+    - name: Test WordPress access
+      wait_for:
+        host: "{{ master_ip }}"
+        port: "{{ wordpress_nodeport }}"
+        timeout: 60
